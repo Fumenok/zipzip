@@ -1,0 +1,644 @@
+
+
+"""
+Telegram casino bot для флуда: ставки на эмодзи-игры (кубик, слоты, дартс,
+боулинг, баскетбол, футбол), баланс, статистика, бонусы, админ-команды.
+Требует: pip install aiogram (v3.x), Python 3.10+
+"""
+
+import asyncio
+import logging
+import sqlite3
+from collections import defaultdict
+from datetime import datetime, timedelta
+from time import monotonic
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ContentType
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+
+# ======================================================================
+#                               КОНФИГ
+# ======================================================================
+BOT_TOKEN = "9024082001:AAFOLznrEG2HpziyFH0p39-XhjkZJOGLgbo"
+DB_PATH = "casino.db"
+
+START_BALANCE = 1000        # стартовый баланс новичка
+MIN_BET = 10                # минимальная ставка
+MAX_BET = 1000             # максимальная ставка
+BONUS_AMOUNT = 500          # сумма ежедневного бонуса
+BONUS_COOLDOWN_HOURS = 4   # кулдаун бонуса
+
+ADMIN_USERNAMES = ['vikaaaaxz', 'fumenok']              # например: [123456789, 987654321]
+PENDING_TIMEOUT_SEC = 30   # сколько секунд ждём эмодзи после /bet
+
+# ======================================================================
+#                            ЛОГИРОВАНИЕ
+# ======================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ======================================================================
+#                         БАЗА ДАННЫХ (SQLITE)
+# ======================================================================
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+cur.execute("PRAGMA foreign_keys = ON")
+
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    chat_id        INTEGER,
+    user_id        INTEGER,
+    username       TEXT,
+    first_name     TEXT,
+    balance        INTEGER NOT NULL DEFAULT 1000,
+    total_bet      INTEGER NOT NULL DEFAULT 0,
+    total_won      INTEGER NOT NULL DEFAULT 0,
+    total_lost     INTEGER NOT NULL DEFAULT 0,
+    games_played   INTEGER NOT NULL DEFAULT 0,
+    wins_count     INTEGER NOT NULL DEFAULT 0,
+    biggest_win    INTEGER NOT NULL DEFAULT 0,
+    is_banned      INTEGER NOT NULL DEFAULT 0,
+    last_bonus_at  TIMESTAMP,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, user_id) /* <-- Теперь ключ состоит из двух частей */
+);
+
+CREATE TABLE IF NOT EXISTS bets (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    game          TEXT NOT NULL,
+    bet_amount    INTEGER NOT NULL,
+    result_value  INTEGER,
+    payout        INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    amount     INTEGER NOT NULL,
+    comment    TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_bets_user ON bets(chat_id, user_id);
+""")
+conn.commit()
+conn.commit()
+logger.info("База данных инициализирована: %s", DB_PATH)
+
+# ---------- Помощники для работы с БД ----------
+
+def ensure_user(chat_id: int, user) -> None:
+    cur.execute("SELECT user_id FROM users WHERE chat_id = ? AND user_id = ?", (chat_id, user.id))
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO users (chat_id, user_id, username, first_name, balance) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, user.id, user.username, user.first_name, START_BALANCE),
+        )
+    else:
+        cur.execute(
+            "UPDATE users SET username = ?, first_name = ?, last_seen_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND user_id = ?",
+            (user.username, user.first_name, chat_id, user.id)
+        )
+    conn.commit()
+
+def ensure_user_by_id(chat_id: int, user_id: int) -> None:
+    cur.execute("SELECT user_id FROM users WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO users (chat_id, user_id, first_name, balance) VALUES (?, ?, ?, ?)",
+            (chat_id, user_id, "User", START_BALANCE),
+        )
+        conn.commit()
+
+def get_user(chat_id: int, user_id: int):
+    cur.execute("SELECT * FROM users WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+    return cur.fetchone()
+
+def get_balance(chat_id: int, user_id: int) -> int:
+    row = get_user(chat_id, user_id)
+    return row["balance"] if row else 0
+
+def is_banned(chat_id: int, user_id: int) -> bool:
+    row = get_user(chat_id, user_id)
+    return bool(row and row["is_banned"])
+
+def place_bet(chat_id: int, user_id: int, game: str, bet_amount: int, payout: int, result_value: int | None = None) -> None:
+    won = payout > bet_amount
+    lost_completely = payout == 0
+    cur.execute("""
+        UPDATE users SET
+            balance      = balance + ?,
+            total_bet    = total_bet + ?,
+            total_won    = total_won + ?,
+            total_lost   = total_lost + ?,
+            games_played = games_played + 1,
+            wins_count   = wins_count + ?,
+            biggest_win  = MAX(biggest_win, ?),
+            last_seen_at = CURRENT_TIMESTAMP
+        WHERE chat_id = ? AND user_id = ?
+    """, (
+        payout - bet_amount,
+        bet_amount,
+        payout if won else 0,
+        bet_amount if lost_completely else 0,
+        1 if won else 0,
+        payout if won else 0,
+        chat_id,
+        user_id,
+    ))
+    cur.execute(
+        "INSERT INTO bets (chat_id, user_id, game, bet_amount, result_value, payout) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, user_id, game, bet_amount, result_value, payout),
+    )
+    conn.commit()
+
+def add_transaction(chat_id: int, user_id: int, type_: str, amount: int, comment: str | None = None) -> None:
+    cur.execute(
+        "INSERT INTO transactions (chat_id, user_id, type, amount, comment) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, user_id, type_, amount, comment),
+    )
+    cur.execute("UPDATE users SET balance = balance + ? WHERE chat_id = ? AND user_id = ?", (amount, chat_id, user_id))
+    conn.commit()
+
+def get_profile(chat_id: int, user_id: int) -> dict | None:
+    row = get_user(chat_id, user_id)
+    if not row:
+        return None
+    data = dict(row)
+    data["win_rate"] = round(data["wins_count"] / data["games_played"] * 100, 1) if data["games_played"] else 0.0
+    return data
+
+def get_top_all_time(chat_id: int):
+    """Топ за всё время (по текущему балансу) в конкретном чате"""
+    cur.execute(
+        "SELECT user_id, first_name, username, balance, "
+        "CAST(((balance * 1.0) / -10.0) + 100 AS INTEGER) as coo_result "
+        "FROM users WHERE chat_id = ? ORDER BY coo_result ASC",
+        (chat_id,)
+    )
+    return cur.fetchall()
+
+def get_top_weekly(chat_id: int):
+    """Топ за последние 7 дней в конкретном чате"""
+    cur.execute("""
+        SELECT u.first_name, u.username, 
+               SUM(b.payout - b.bet_amount) as weekly_balance,
+               CAST((SUM(b.payout - b.bet_amount) * 1.0 / -10.0) + 100 AS INTEGER) as coo_result
+        FROM bets b
+        JOIN users u ON b.user_id = u.user_id AND b.chat_id = u.chat_id
+        WHERE b.created_at >= datetime('now', '-7 days') AND b.chat_id = ?
+        GROUP BY b.user_id, b.chat_id
+        ORDER BY coo_result ASC
+    """, (chat_id,))
+    return cur.fetchall()
+
+def get_user_id_by_arg(chat_id: int, arg: str) -> int | None:
+    """Ищет ID игрока по нику (@username) или цифрам ВНУТРИ конкретного чата."""
+    arg = arg.strip()
+    if arg.startswith("@"):
+        username_clean = arg[1:].lower()
+        cur.execute("SELECT user_id FROM users WHERE chat_id = ? AND LOWER(username) = ?", (chat_id, username_clean))
+        row = cur.fetchone()
+        return row["user_id"] if row else None
+    elif arg.isdigit():
+        ensure_user_by_id(chat_id, int(arg))
+        return int(arg)
+    return None
+
+# ======================================================================
+#                         ИГРОВАЯ ЛОГИКА
+# ======================================================================
+SLOT_SYMBOLS = ["BAR", "🍒", "🍋", "7️⃣"]
+GAME_NAMES = {
+    "🎲": "dice", "🎯": "dart", "🎳": "bowling",
+    "🏀": "basketball", "⚽": "football", "🎰": "slots",
+}
+
+def decode_slot(value: int) -> tuple[str, str, str]:
+    """value (1..64) → три символа на барабанах (четверичное представление)."""
+    n = value - 1
+    reels = []
+    for _ in range(3):
+        reels.append(SLOT_SYMBOLS[n % 4])
+        n //= 4
+    return tuple(reversed(reels))  # type: ignore[return-value]
+
+def slot_payout(value: int, bet: int) -> tuple[int, str]:
+    a, b, c = decode_slot(value)
+    combo = f"{a} | {b} | {c}"
+    if a == b == c:
+        if a == "7️⃣":
+            return bet * 10, "🎉 ДЖЕКПОТ 7️⃣7️⃣7️⃣! (x10)" # Снизили с 15 до 10
+        if a == "BAR":
+            return bet * 4, "🔥 BAR BAR BAR (x4)" # Снизили с 5 до 4
+        if a == "🍋":
+            return bet * 2, "✨ 🍋🍋🍋 (x2)"
+        return int(bet * 1.5), "👍 🍒🍒🍒 (x1.5)" # Снизили с 2 до 1.5
+    
+    # УДАЛИЛИ БЛОК С ДВУМЯ ОДИНАКОВЫМИ (теперь это проигрыш)
+    return 0, f"💨 {combo} — мимо"
+
+def resolve_game(emoji: str, value: int, bet: int) -> tuple[int, str]:
+    """Возвращает (payout, описание). payout = 0 — проигрыш, = bet — возврат."""
+    if emoji == "🎰":
+        return slot_payout(value, bet)
+    if emoji == "🎲":
+        if value == 6: # Выигрыш только если выпадет 6
+            return bet * 2, f"🎲 Выпало {value} — победа (x2)"
+        return 0, f"🎲 Выпало {value} — проигрыш" # 4 и 5 теперь проигрыш
+    if emoji == "🎯":
+        if value == 6:
+            return bet * 3, "🎯 В яблочко! (x3)" # Уменьшили выплату с x5 до x3
+        return 0, f"🎯 {value} — мимо"
+    if emoji == "🎳":
+        if value == 6:
+            return bet * 3, "🎳 СТРАЙК! (x3)"
+        return 0, f"🎳 {value} — мимо"
+    if emoji == "🏀":
+        if value == 5: # Только 5 — это победа
+            return bet * 2, f"🏀 {value} — попадание! (x2)"
+        return 0, f"🏀 {value} — мимо"
+    if emoji == "⚽":
+        if value == 5: # Только 5 — это гол
+            return bet * 2, f"⚽ {value} — гол! (x2)"
+        return 0, f"⚽ {value} — мимо"
+    return bet, "Неизвестная игра — возврат"
+
+# ======================================================================
+#                ОЖИДАЮЩИЕ СТАВКИ (in-memory, ключ — user_id)
+# ======================================================================
+pending_bets: dict[int, dict] = {}
+
+# ======================================================================
+#                         БОТ И ДИСПЕТЧЕР
+# ======================================================================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+# ---------- Middleware: простой rate-limit (1 запрос/сек на юзера) ----------
+class ThrottlingMiddleware:
+    def __init__(self, rate_limit: float = 1.0):
+        self.rate_limit = rate_limit
+        self.last: dict[int, float] = defaultdict(float)
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message) or event.from_user is None:
+            return await handler(event, data)
+        uid = event.from_user.id
+        now = monotonic()
+        if now - self.last[uid] < self.rate_limit:
+            return  # тихо дропаем слишком частые сообщения
+        self.last[uid] = now
+        return await handler(event, data)
+
+dp.message.outer_middleware(ThrottlingMiddleware(1.0))
+
+# ---------- Хелпер для админ-проверок ----------
+def is_admin(uid: int, username: str | None) -> bool:
+    # Если ID в старом списке (если оставили) ИЛИ ник в новом списке
+    if not username:
+        return False
+    return username.lower() in ADMIN_USERNAMES
+
+# ======================================================================
+#                            ХЕНДЛЕРЫ
+# ======================================================================
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user)
+    balance = get_balance(chat_id, message.from_user.id)
+    await message.reply(
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        f"💰 Твой баланс: <b>{balance}</b>\n\n"
+        f"🎰 <b>Игры:</b>\n"
+        f"• /bet &lt;сумма&gt; — поставить, затем отправить эмодзи\n"
+        f"  Доступно: 🎲 🎯 🎳 🏀 ⚽ 🎰\n"
+        f"• /profile — профиль и статистика\n"
+        f"• /balance — баланс\n"
+        f"• /top — топ игроков\n"
+        f"• /bonus — ежедневный бонус ({BONUS_AMOUNT})\n"
+        f"• /cancel — отменить активную ставку\n\n"
+        f"⚖️ Мин. ставка: {MIN_BET} | Макс.: {MAX_BET}",
+        parse_mode="HTML",
+    )
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await cmd_start(message)
+
+@router.message(Command("balance"))
+async def cmd_balance(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user)
+    await message.reply(f"💰 Баланс: <b>{get_balance(chat_id, message.from_user.id)}</b>", parse_mode="HTML")
+
+
+@router.message(Command("coo"))
+async def cmd_coo(message: Message):
+    ensure_user(message.from_user)
+    uid = message.from_user.id
+    balance = get_balance(uid)
+    
+    # Считаем результат и сразу оборачиваем в int(), чтобы отбросить копейки
+    result = int((balance / -10) + 100)
+    
+    await message.reply(
+        f"🧮 Долг: <b>{result}</b>\n", 
+        parse_mode="HTML"
+    )
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user)
+    p = get_profile(chat_id, message.from_user.id)
+    uname = f"@{p['username']}" if p["username"] else "—"
+    await message.reply(
+        f"👤 <b>{p['first_name']}</b> ({uname})\n"
+        f"💰 Баланс: <b>{p['balance']}</b>\n"
+        f"🎮 Игр: {p['games_played']} (побед: {p['wins_count']}, {p['win_rate']}%)\n"
+        f"📈 Всего поставлено: {p['total_bet']}\n"
+        f"💸 Всего проиграно: {p['total_lost']}\n"
+        f"🏆 Крупнейший выигрыш: {p['biggest_win']}",
+        parse_mode="HTML",
+    )
+
+@router.message(Command("top_all"))
+async def cmd_top_all(message: Message):
+    chat_id = message.chat.id
+    rows = get_top_all_time(chat_id)
+    if not rows:
+        await message.reply("Пока никого нет в топе.")
+        return
+
+    current_text = "🏆 <b>ТОП за всё время (в этом чате)</b>\n"
+    for i, r in enumerate(rows, 1):
+        name = r["first_name"] or "—"
+        if r["username"]: name += f" (@{r['username']})"
+        line = f"{i}. {name} — <b>{r['coo_result']}</b> (Баланс: {r['balance']})\n"
+        
+        if len(current_text) + len(line) > 4000:
+            await message.reply(current_text, parse_mode="HTML")
+            current_text = ""
+        current_text += line
+
+    if current_text:
+        await message.reply(current_text, parse_mode="HTML")
+
+@router.message(Command("top_week"))
+async def cmd_top_week(message: Message):
+    chat_id = message.chat.id
+    rows = get_top_weekly(chat_id)
+    if not rows:
+        await message.reply("За последнюю неделю никто не играл в этом чате.")
+        return
+
+    current_text = "📅 <b>ТОП за последние 7 дней (в этом чате)</b>\n"
+    for i, r in enumerate(rows, 1):
+        name = r["first_name"] or "—"
+        if r["username"]: name += f" (@{r['username']})"
+        line = f"{i}. {name} — <b>{r['coo_result']}</b> (Изменение баланса: {r['weekly_balance']})\n"
+        
+        if len(current_text) + len(line) > 4000:
+            await message.reply(current_text, parse_mode="HTML")
+            current_text = ""
+        current_text += line
+
+    if current_text:
+        await message.reply(current_text, parse_mode="HTML")
+
+@router.message(Command("bonus"))
+async def cmd_bonus(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user)
+    uid = message.from_user.id
+    row = get_user(chat_id, uid)
+    now = datetime.utcnow()
+    if row["last_bonus_at"]:
+        last = datetime.fromisoformat(row["last_bonus_at"])
+        if now - last < timedelta(hours=BONUS_COOLDOWN_HOURS):
+            # ... (проверка кулдауна) ...
+            return
+    add_transaction(chat_id, uid, "bonus", BONUS_AMOUNT, "Ежедневный бонус")
+    cur.execute("UPDATE users SET last_bonus_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND user_id = ?", (chat_id, uid))
+    conn.commit()
+    await message.reply(f"🎁 Ты получил бонус <b>{BONUS_AMOUNT}</b>!\n💰 Новый баланс: <b>{get_balance(chat_id, uid)}</b>", parse_mode="HTML")
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    uid = message.from_user.id
+    if pending_bets.pop(uid, None):
+        await message.reply("❎ Ставка отменена.")
+    else:
+        await message.reply("У тебя нет активной ставки.")
+
+@router.message(Command("bet"))
+async def cmd_bet(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user)
+    uid = message.from_user.id
+
+    if is_banned(chat_id, uid):
+        await message.reply("❌ Ты забанен в казино.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("Использование: <code>/bet 100</code>\nПотом отправь 🎲 🎯 🎳 🏀 ⚽ 🎰", parse_mode="HTML")
+        return
+    try:
+        bet = int(args[1].strip())
+    except ValueError:
+        await message.reply("❌ Сумма должна быть целым числом.")
+        return
+    if bet < MIN_BET:
+        await message.reply(f"❌ Минимальная ставка: {MIN_BET}")
+        return
+    if bet > MAX_BET:
+        await message.reply(f"❌ Максимальная ставка: {MAX_BET}")
+        return
+
+    existing = pending_bets.get(uid)
+    if existing:
+        elapsed = (datetime.utcnow() - existing["created_at"]).total_seconds()
+        if elapsed < PENDING_TIMEOUT_SEC:
+            await message.reply("⚠️ У тебя уже есть активная ставка. Отправь эмодзи или /cancel.")
+            return
+        del pending_bets[uid]
+
+
+    # ВОТ ЗДЕСЬ МЫ ПЕРЕДАЕМ CHAT_ID
+    pending_bets[uid] = {"chat_id": chat_id, "bet": bet, "created_at": datetime.utcnow()}
+    
+    await message.reply(
+        f"✅ Ставка <b>{bet}</b> принята.\n"
+        f"Отправь в чат одно из эмодзи: 🎲 🎯 🎳 🏀 ⚽ 🎰\n"
+        f"⏱ У тебя {PENDING_TIMEOUT_SEC // 60} мин. Отмена — /cancel.",
+        parse_mode="HTML",
+    )
+
+@router.message(F.content_type == ContentType.DICE)
+async def on_dice(message: Message):
+    chat_id = message.chat.id
+    ensure_user(chat_id, message.from_user)
+    uid = message.from_user.id
+    
+    dice = message.dice  # <--- ВОТ ЭТА СТРОКА ПОТЕРЯЛАСЬ
+    
+    if dice is None:
+        return
+
+    # --- Античит: запрещаем пересланные кубики ---
+    if getattr(message, "forward_origin", None) is not None or getattr(message, "forward_from", None) is not None:
+        await message.reply("❌ Пересланные кубики не принимаются. Бросьте сами.")
+        return
+
+    bet_info = pending_bets.pop(uid, None)
+    if not bet_info:
+        return  # без активной ставки просто игнорируем
+
+    # Проверяем, что кубик бросили в том же чате, где делали ставку
+    if bet_info["chat_id"] != chat_id:
+        return
+
+    elapsed = (datetime.utcnow() - bet_info["created_at"]).total_seconds()
+    if elapsed > PENDING_TIMEOUT_SEC:
+        await message.reply("⏰ Время на ставку истекло. Начни заново: /bet <сумма>")
+        return
+
+    bet = bet_info["bet"]
+    emoji = dice.emoji
+    value = dice.value
+
+    if emoji not in GAME_NAMES:
+        await message.reply(f"❌ Эмодзи {emoji} не участвует в игре. Ставка возвращена.")
+        return
+
+    game = GAME_NAMES[emoji]
+    payout, desc = resolve_game(emoji, value, bet)
+    place_bet(chat_id, uid, game, bet, payout, value)
+
+    await message.reply(
+        f"{desc}\n"
+        f"💵 Ставка: {bet} | Выплата: <b>{payout}</b>\n"
+        f"💰 Баланс: <b>{get_balance(chat_id, uid)}</b>",
+        parse_mode="HTML",
+    )
+    
+
+# ---------- Админ-команды ----------
+@router.message(Command("add_balance"))
+async def cmd_add_balance(message: Message):
+    chat_id = message.chat.id
+    # Проверка прав с учетом юзернейма
+    if not is_admin(message.from_user.id, message.from_user.username):
+        await message.reply("⛔ Нет прав.")
+        return
+
+    # Если админ ответил (Reply) на чье-то сообщение
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+        ensure_user_by_id(target)
+        args = message.text.split()
+        amount = int(args[1]) if len(args) > 1 and args[1].lstrip('-').isdigit() else 0
+    else:
+        # Если написали текстом: /add_balance @nick 500
+        args = message.text.split()
+        if len(args) < 3:
+            await message.reply("Использование: /add_balance @ник 500 (или ответьте на сообщение игрока)")
+            return
+        target = get_user_id_by_arg(args[1])
+        if not target:
+            await message.reply("❌ Игрок с таким ником не найден. (Он должен сначала написать боту).")
+            return
+        try:
+            amount = int(args[2])
+        except ValueError:
+            await message.reply("❌ Сумма должна быть числом.")
+            return
+
+    add_transaction(target, "admin_add", amount, f"admin={message.from_user.id}")
+    await message.reply(
+        f"✅ Начислено <b>{amount}</b> игроку <code>{target}</code>.\n"
+        f"Его баланс: <b>{get_balance(target)}</b>",
+        parse_mode="HTML",
+    )
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    chat_id = message.chat.id
+    if not is_admin(message.from_user.id, message.from_user.username):
+        await message.reply("⛔ Нет прав.")
+        return
+
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+        ensure_user_by_id(target)
+    else:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply("Использование: /ban @ник (или ответьте на сообщение)")
+            return
+        target = get_user_id_by_arg(args[1])
+        if not target:
+            await message.reply("❌ Игрок с таким ником не найден.")
+            return
+
+    cur.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target,))
+    conn.commit()
+    await message.reply(f"🚫 Пользователь {target} забанен.")
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    chat_id = message.chat.id
+    if not is_admin(message.from_user.id, message.from_user.username):
+        await message.reply("⛔ Нет прав.")
+        return
+
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user.id
+        ensure_user_by_id(target)
+    else:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.reply("Использование: /unban @ник (или ответьте на сообщение)")
+            return
+        target = get_user_id_by_arg(args[1])
+        if not target:
+            await message.reply("❌ Игрок с таким ником не найден.")
+            return
+
+    cur.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target,))
+    conn.commit()
+    await message.reply(f"✅ Пользователь {target} разбанен.")
+
+# ======================================================================
+#                              ЗАПУСК
+# ======================================================================
+async def main():
+    if BOT_TOKEN == ".":
+        logger.error("Укажи BOT_TOKEN в начале файла!")
+        return
+    logger.info("Бот запускается...")
+    await dp.start_polling(bot, skip_updates=True)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
